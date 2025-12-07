@@ -194,6 +194,38 @@ async def search_calendar(query: str) -> List[Dict]:
         return []
 
 
+def search_calendar_tool(start_date: str = None, end_date: str = None, query: str = None):
+    """
+    Tool function for OpenAI to call
+    Search Google Calendar for events
+    """
+    try:
+        print(f"[TOOL CALL] search_calendar - start: {start_date}, end: {end_date}, query: {query}")
+        
+        params = {}
+        if start_date:
+            params["start_date"] = start_date
+        if end_date:
+            params["end_date"] = end_date
+        if query:
+            params["query"] = query
+            
+        result = mcp_manager.call_server(
+            "calendar",
+            "tools/call",
+            {
+                "name": "search_events",
+                "arguments": params
+            }
+        )
+        print(f"[TOOL RESULT] Calendar: {result}")
+        return json.dumps(result)
+    except Exception as e:
+        print(f"Calendar tool error: {e}")
+        traceback.print_exc()
+        return json.dumps({"error": str(e)})
+
+
 async def search_notion(query: str) -> List[Dict]:
     """Search Notion via MCP server"""
     try:
@@ -214,80 +246,180 @@ async def search_notion(query: str) -> List[Dict]:
         return []
 
 
+def search_notion_tool(query: str):
+    """
+    Tool function for OpenAI to call
+    Search Notion pages and databases
+    """
+    try:
+        print(f"[TOOL CALL] search_notion - query: {query}")
+        
+        result = mcp_manager.call_server(
+            "notion",
+            "tools/call",
+            {
+                "name": "search",
+                "arguments": {"query": query}
+            }
+        )
+        print(f"[TOOL RESULT] Notion: {result}")
+        return json.dumps(result)
+    except Exception as e:
+        print(f"Notion tool error: {e}")
+        traceback.print_exc()
+        return json.dumps({"error": str(e)})
+
+
 async def search_drive(query: str) -> List[Dict]:
     """Google Drive removed - not implemented"""
     return []
 
 
-async def fetch_from_sources(query: str, sources: List[str]) -> Dict[str, List]:
+# OpenAI Tools Definition
+OPENAI_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_calendar",
+            "description": "Search Google Calendar for events. Use this to find meetings, appointments, and scheduled events.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "start_date": {
+                        "type": "string",
+                        "description": "Start date in YYYY-MM-DD format (e.g., 2024-12-07)"
+                    },
+                    "end_date": {
+                        "type": "string",
+                        "description": "End date in YYYY-MM-DD format (e.g., 2024-12-14)"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Search query for event titles or descriptions"
+                    }
+                }
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_notion",
+            "description": "Search Notion pages and databases. Use this to find notes, documents, project information, and tasks.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Search query to find in Notion pages"
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    }
+]
+
+# Map function names to actual functions
+TOOL_FUNCTIONS = {
+    "search_calendar": search_calendar_tool,
+    "search_notion": search_notion_tool
+}
+
+
+async def query_with_openai_tools(question: str):
     """
-    Fetch data from requested MCP servers in parallel
+    Query OpenAI with function calling - it decides which tools to use
     """
-    import asyncio
+    messages = [
+        {
+            "role": "system",
+            "content": "You are a helpful assistant with access to the user's Notion and Google Calendar. Use the available tools to search for information and answer questions accurately."
+        },
+        {
+            "role": "user",
+            "content": question
+        }
+    ]
     
-    tasks = {}
-    if "calendar" in sources:
-        tasks["calendar"] = search_calendar(query)
-    if "notion" in sources:
-        tasks["notion"] = search_notion(query)
-    
-    # Execute all tasks in parallel
-    results = {}
-    completed = await asyncio.gather(*tasks.values(), return_exceptions=True)
-    
-    for (source_name, _), result in zip(tasks.items(), completed):
-        if isinstance(result, Exception):
-            print(f"Error fetching from {source_name}: {result}")
-            results[source_name] = []
-        else:
-            results[source_name] = result
-    
-    return results
-
-
-async def query_with_openai(question: str, context_data: Dict) -> str:
-    """
-    Query OpenAI with context from MCP servers
-    """
-    # Build context from all sources
-    context = ""
-    for source, items in context_data.items():
-        if items:
-            context += f"\n\n{source.upper()} Data:\n"
-            if isinstance(items, list):
-                for item in items:
-                    if isinstance(item, dict):
-                        title = item.get('title', item.get('name', 'Untitled'))
-                        content = item.get('content', item.get('description', ''))
-                        context += f"- {title}: {content}\n"
-    
-    if not context.strip():
-        return "No relevant information found in your knowledge base."
-    
-    # Create prompt
-    prompt = f"""Based on the following information from the user's knowledge base, answer their question.
-
-Context:
-{context}
-
-Question: {question}
-
-Provide a comprehensive answer and cite which sources you used."""
-
     try:
+        # Initial call to OpenAI with tools
+        print(f"[DEBUG] Calling OpenAI with question: {question}")
         response = client.chat.completions.create(
-            model="gpt-4o-nano",
-            messages=[
-                {"role": "system", "content": "You are a helpful assistant that searches through a user's personal knowledge base (Notion, Calendar) to answer questions."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.7,
-            max_tokens=800
+            model="gpt-4.1-nano",
+            messages=messages,
+            tools=OPENAI_TOOLS,
+            tool_choice="auto"
         )
         
-        return response.choices[0].message.content
+        response_message = response.choices[0].message
+        tool_calls = response_message.tool_calls
+        
+        # If no tool calls, return the response
+        if not tool_calls:
+            return {
+                "answer": response_message.content,
+                "tool_calls": [],
+                "sources": []
+            }
+        
+        # Execute tool calls
+        messages.append(response_message)
+        
+        tool_results = []
+        sources = []
+        
+        for tool_call in tool_calls:
+            function_name = tool_call.function.name
+            function_args = json.loads(tool_call.function.arguments)
+            
+            print(f"[DEBUG] OpenAI wants to call: {function_name} with {function_args}")
+            
+            # Execute the tool
+            if function_name in TOOL_FUNCTIONS:
+                function_response = TOOL_FUNCTIONS[function_name](**function_args)
+                tool_results.append({
+                    "tool": function_name,
+                    "result": function_response
+                })
+                
+                # Parse results for sources
+                try:
+                    result_data = json.loads(function_response)
+                    if isinstance(result_data, list):
+                        for item in result_data:
+                            if isinstance(item, dict):
+                                sources.append({
+                                    "name": f"{function_name}/{item.get('title', 'Untitled')}",
+                                    "content": item.get('content', '')[:200],
+                                    "url": item.get('url', '')
+                                })
+                except:
+                    pass
+                
+                # Add tool result to messages
+                messages.append({
+                    "tool_call_id": tool_call.id,
+                    "role": "tool",
+                    "name": function_name,
+                    "content": function_response
+                })
+        
+        # Get final response from OpenAI with tool results
+        print(f"[DEBUG] Getting final answer from OpenAI with tool results")
+        final_response = client.chat.completions.create(
+            model="gpt-4.1-nano",
+            messages=messages
+        )
+        
+        return {
+            "answer": final_response.choices[0].message.content,
+            "tool_calls": [tc.function.name for tc in tool_calls],
+            "sources": sources
+        }
+        
     except Exception as e:
-        print(f"OpenAI API error: {e}")
+        print(f"OpenAI tool calling error: {e}")
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"OpenAI API error: {str(e)}")
 
@@ -332,33 +464,28 @@ def check_servers_status():
 @app.post("/query", response_model=QueryResponse)
 async def query_knowledge_base(request: QueryRequest):
     """
-    Query across Notion and Calendar using MCP servers
+    Query across Notion and Calendar using OpenAI function calling
+    OpenAI decides which tools to call based on the question
     """
     try:
-        # Step 1: Fetch data from MCP servers
-        print(f"[DEBUG] Fetching from sources: {request.sources}")
-        context_data = await fetch_from_sources(request.question, request.sources)
-        print(f"[DEBUG] Context data: {context_data}")
+        print(f"[DEBUG] Processing query: {request.question}")
         
-        # Step 2: Query OpenAI with context
-        answer = await query_with_openai(request.question, context_data)
+        # Let OpenAI decide which tools to call
+        result = await query_with_openai_tools(request.question)
         
-        # Step 3: Format response
+        # Format response
         sources = []
-        for source_name, items in context_data.items():
-            if isinstance(items, list):
-                for item in items:
-                    if isinstance(item, dict):
-                        sources.append(Source(
-                            name=f"{source_name}/{item.get('title', item.get('name', 'Untitled'))}",
-                            content=item.get('content', item.get('description', ''))[:200],
-                            url=item.get('url', item.get('link'))
-                        ))
+        for source_data in result["sources"]:
+            sources.append(Source(
+                name=source_data["name"],
+                content=source_data["content"],
+                url=source_data.get("url")
+            ))
         
         return QueryResponse(
-            answer=answer,
+            answer=result["answer"],
             sources=sources,
-            tools_used=request.sources
+            tools_used=result["tool_calls"]
         )
     
     except Exception as e:
