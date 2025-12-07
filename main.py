@@ -3,6 +3,7 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import os
 import httpx
+import traceback
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -15,15 +16,14 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 # MCP Server endpoints (these will be running separately)
 MCP_SERVERS = {
     "calendar": os.getenv("CALENDAR_MCP_URL", "http://localhost:3001"),
-    "notion": os.getenv("NOTION_MCP_URL", "http://localhost:3002"),
-    "drive": os.getenv("DRIVE_MCP_URL", "http://localhost:3003")
+    "notion": os.getenv("NOTION_MCP_URL", "http://localhost:3002")
 }
 
 
 # Schemas
 class QueryRequest(BaseModel):
     question: str
-    sources: Optional[List[str]] = ["drive", "notion", "calendar"]
+    sources: Optional[List[str]] = ["notion", "calendar"]
 
 
 class Source(BaseModel):
@@ -62,14 +62,21 @@ async def call_mcp_server(server_url: str, method: str, params: Dict[str, Any]) 
             
             return data.get("result", {})
         except httpx.ConnectError:
-            raise Exception(f"Cannot connect to MCP server at {server_url}. Is it running?")
+            error_msg = f"Cannot connect to MCP server at {server_url}. Is it running?"
+            print(error_msg)
+            traceback.print_exc()
+            raise Exception(error_msg)
         except Exception as e:
-            raise Exception(f"MCP Server communication error: {str(e)}")
+            error_msg = f"MCP Server communication error: {str(e)}"
+            print(error_msg)
+            traceback.print_exc()
+            raise Exception(error_msg)
 
 
 async def search_calendar(query: str) -> List[Dict]:
     """Search Google Calendar via MCP server"""
     try:
+        print(f"[DEBUG] Searching calendar with query: {query}")
         result = await call_mcp_server(
             MCP_SERVERS["calendar"],
             "tools/call",
@@ -78,15 +85,18 @@ async def search_calendar(query: str) -> List[Dict]:
                 "arguments": {"query": query}
             }
         )
+        print(f"[DEBUG] Calendar result: {result}")
         return result if isinstance(result, list) else []
     except Exception as e:
         print(f"Calendar search error: {e}")
+        traceback.print_exc()
         return []
 
 
 async def search_notion(query: str) -> List[Dict]:
     """Search Notion via MCP server"""
     try:
+        print(f"[DEBUG] Searching Notion with query: {query}")
         result = await call_mcp_server(
             MCP_SERVERS["notion"],
             "tools/call",
@@ -95,27 +105,17 @@ async def search_notion(query: str) -> List[Dict]:
                 "arguments": {"query": query}
             }
         )
+        print(f"[DEBUG] Notion result: {result}")
         return result if isinstance(result, list) else []
     except Exception as e:
         print(f"Notion search error: {e}")
+        traceback.print_exc()
         return []
 
 
 async def search_drive(query: str) -> List[Dict]:
-    """Search Google Drive via MCP server"""
-    try:
-        result = await call_mcp_server(
-            MCP_SERVERS["drive"],
-            "tools/call",
-            {
-                "name": "search_files",
-                "arguments": {"query": query}
-            }
-        )
-        return result if isinstance(result, list) else []
-    except Exception as e:
-        print(f"Drive search error: {e}")
-        return []
+    """Google Drive removed - not implemented"""
+    return []
 
 
 async def fetch_from_sources(query: str, sources: List[str]) -> Dict[str, List]:
@@ -129,8 +129,6 @@ async def fetch_from_sources(query: str, sources: List[str]) -> Dict[str, List]:
         tasks["calendar"] = search_calendar(query)
     if "notion" in sources:
         tasks["notion"] = search_notion(query)
-    if "drive" in sources:
-        tasks["drive"] = search_drive(query)
     
     # Execute all tasks in parallel
     results = {}
@@ -177,9 +175,9 @@ Provide a comprehensive answer and cite which sources you used."""
 
     try:
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o-nano",
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that searches through a user's personal knowledge base (Google Drive, Notion, Calendar) to answer questions."},
+                {"role": "system", "content": "You are a helpful assistant that searches through a user's personal knowledge base (Notion, Calendar) to answer questions."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7,
@@ -188,6 +186,8 @@ Provide a comprehensive answer and cite which sources you used."""
         
         return response.choices[0].message.content
     except Exception as e:
+        print(f"OpenAI API error: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"OpenAI API error: {str(e)}")
 
 
@@ -229,11 +229,13 @@ async def check_servers_status():
 @app.post("/query", response_model=QueryResponse)
 async def query_knowledge_base(request: QueryRequest):
     """
-    Query across Google Drive, Notion, and Calendar using MCP servers
+    Query across Notion and Calendar using MCP servers
     """
     try:
         # Step 1: Fetch data from MCP servers
+        print(f"[DEBUG] Fetching from sources: {request.sources}")
         context_data = await fetch_from_sources(request.question, request.sources)
+        print(f"[DEBUG] Context data: {context_data}")
         
         # Step 2: Query OpenAI with context
         answer = await query_with_openai(request.question, context_data)
@@ -257,6 +259,8 @@ async def query_knowledge_base(request: QueryRequest):
         )
     
     except Exception as e:
+        print(f"Query error: {e}")
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
 
