@@ -2,8 +2,11 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import os
-import httpx
+import json
+import subprocess
+import threading
 import traceback
+from queue import Queue
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -13,10 +16,23 @@ app = FastAPI(title="Knowledge Base Assistant API")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
-# MCP Server endpoints (these will be running separately)
+# MCP Server configurations
 MCP_SERVERS = {
-    "calendar": os.getenv("CALENDAR_MCP_URL", "http://localhost:3001"),
-    "notion": os.getenv("NOTION_MCP_URL", "http://localhost:3002")
+    "calendar": {
+        "command": "npx",
+        "args": ["@cocal/google-calendar-mcp"],
+        "env": {
+            "GOOGLE_CLIENT_ID": os.getenv("GOOGLE_CLIENT_ID"),
+            "GOOGLE_CLIENT_SECRET": os.getenv("GOOGLE_CLIENT_SECRET")
+        }
+    },
+    "notion": {
+        "command": "npx",
+        "args": ["@notionhq/notion-mcp-server"],
+        "env": {
+            "NOTION_API_KEY": os.getenv("NOTION_API_KEY")
+        }
+    }
 }
 
 
@@ -38,47 +54,132 @@ class QueryResponse(BaseModel):
     tools_used: List[str]
 
 
-# MCP Server Communication via HTTP
-async def call_mcp_server(server_url: str, method: str, params: Dict[str, Any]) -> Any:
-    """
-    Call MCP server via HTTP
-    """
-    async with httpx.AsyncClient(timeout=30.0) as http_client:
+# MCP Process Manager with Popen
+class MCPProcessManager:
+    def __init__(self):
+        self.processes: Dict[str, subprocess.Popen] = {}
+        self.response_queues: Dict[str, Queue] = {}
+        self.reader_threads: Dict[str, threading.Thread] = {}
+    
+    def start_server(self, server_name: str):
+        """Start an MCP server process"""
+        if server_name in self.processes:
+            return  # Already running
+        
+        if server_name not in MCP_SERVERS:
+            raise ValueError(f"Unknown server: {server_name}")
+        
+        server_config = MCP_SERVERS[server_name]
+        env = {**os.environ, **server_config["env"]}
+        
+        print(f"[DEBUG] Starting {server_name} MCP server...")
+        
+        # Start process with PIPE
+        process = subprocess.Popen(
+            [server_config["command"]] + server_config["args"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            text=True,
+            bufsize=1
+        )
+        
+        self.processes[server_name] = process
+        self.response_queues[server_name] = Queue()
+        
+        # Start reader thread for stdout
+        reader_thread = threading.Thread(
+            target=self._read_output,
+            args=(server_name, process),
+            daemon=True
+        )
+        reader_thread.start()
+        self.reader_threads[server_name] = reader_thread
+        
+        print(f"[DEBUG] {server_name} MCP server started (PID: {process.pid})")
+    
+    def _read_output(self, server_name: str, process: subprocess.Popen):
+        """Read JSON-RPC responses from stdout"""
         try:
-            response = await http_client.post(
-                f"{server_url}/rpc",
-                json={
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": method,
-                    "params": params
-                }
-            )
-            response.raise_for_status()
-            data = response.json()
-            
-            if "error" in data:
-                raise Exception(f"MCP Server Error: {data['error']}")
-            
-            return data.get("result", {})
-        except httpx.ConnectError:
-            error_msg = f"Cannot connect to MCP server at {server_url}. Is it running?"
-            print(error_msg)
-            traceback.print_exc()
-            raise Exception(error_msg)
+            while True:
+                line = process.stdout.readline()
+                if not line:
+                    break
+                
+                line = line.strip()
+                if line:
+                    print(f"[DEBUG] {server_name} stdout: {line}")
+                    try:
+                        response = json.loads(line)
+                        self.response_queues[server_name].put(response)
+                    except json.JSONDecodeError:
+                        print(f"[DEBUG] {server_name} non-JSON output: {line}")
         except Exception as e:
-            error_msg = f"MCP Server communication error: {str(e)}"
-            print(error_msg)
+            print(f"[ERROR] Reader thread for {server_name} crashed: {e}")
             traceback.print_exc()
-            raise Exception(error_msg)
+    
+    def call_server(self, server_name: str, method: str, params: Dict[str, Any], timeout: int = 10):
+        """
+        Call an MCP server with JSON-RPC request
+        """
+        if server_name not in self.processes:
+            self.start_server(server_name)
+        
+        process = self.processes[server_name]
+        queue = self.response_queues[server_name]
+        
+        # Prepare JSON-RPC request
+        request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": method,
+            "params": params
+        }
+        
+        print(f"[DEBUG] Sending to {server_name}: {request}")
+        
+        # Send request to stdin
+        try:
+            request_json = json.dumps(request) + "\n"
+            process.stdin.write(request_json)
+            process.stdin.flush()
+        except Exception as e:
+            print(f"[ERROR] Failed to write to {server_name}: {e}")
+            traceback.print_exc()
+            raise
+        
+        # Wait for response from queue
+        try:
+            import queue
+            response = queue.get(timeout=timeout)
+            print(f"[DEBUG] Response from {server_name}: {response}")
+            
+            if "error" in response:
+                raise Exception(f"MCP Server Error: {response['error']}")
+            
+            return response.get("result", {})
+        except queue.Empty:
+            raise Exception(f"Timeout waiting for response from {server_name}")
+    
+    def cleanup(self):
+        """Stop all MCP server processes"""
+        for name, process in self.processes.items():
+            print(f"[DEBUG] Stopping {name} MCP server...")
+            process.terminate()
+            process.wait(timeout=5)
+
+
+# Initialize MCP manager
+mcp_manager = MCPProcessManager()
 
 
 async def search_calendar(query: str) -> List[Dict]:
     """Search Google Calendar via MCP server"""
     try:
         print(f"[DEBUG] Searching calendar with query: {query}")
-        result = await call_mcp_server(
-            MCP_SERVERS["calendar"],
+        result = mcp_manager.call_server(
+            "calendar",
             "tools/call",
             {
                 "name": "search_events",
@@ -97,8 +198,8 @@ async def search_notion(query: str) -> List[Dict]:
     """Search Notion via MCP server"""
     try:
         print(f"[DEBUG] Searching Notion with query: {query}")
-        result = await call_mcp_server(
-            MCP_SERVERS["notion"],
+        result = mcp_manager.call_server(
+            "notion",
             "tools/call",
             {
                 "name": "search",
@@ -211,17 +312,19 @@ def health_check():
 
 
 @app.get("/servers/status")
-async def check_servers_status():
+def check_servers_status():
     """Check if all MCP servers are running"""
     status = {}
     
-    async with httpx.AsyncClient(timeout=5.0) as http_client:
-        for name, url in MCP_SERVERS.items():
-            try:
-                response = await http_client.get(f"{url}/health")
-                status[name] = "running" if response.status_code == 200 else "error"
-            except:
-                status[name] = "not running"
+    for name in MCP_SERVERS.keys():
+        if name in mcp_manager.processes:
+            process = mcp_manager.processes[name]
+            if process.poll() is None:
+                status[name] = "running"
+            else:
+                status[name] = "stopped"
+        else:
+            status[name] = "not started"
     
     return {"servers": status}
 
