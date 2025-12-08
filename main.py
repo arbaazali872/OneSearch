@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
+from queue import Queue, Empty
 import os
 import json
 import subprocess
@@ -8,10 +9,7 @@ import threading
 import traceback
 import sys
 import shutil
-# import datetime
 from datetime import datetime
-# from queue import Queue
-from queue import Queue, Empty
 from dotenv import load_dotenv
 from openai import OpenAI
 
@@ -21,19 +19,13 @@ app = FastAPI(title="Knowledge Base Assistant API")
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
-# MCP Server configurations
-import sys
-import shutil
-
 # Find npx executable
 def get_npx_command():
     """Get the correct npx command for the platform"""
     if sys.platform == "win32":
-        # Try to find npx.cmd in PATH
         npx_path = shutil.which("npx.cmd") or shutil.which("npx")
         if npx_path:
             return npx_path
-        # Common Node.js installation paths on Windows
         possible_paths = [
             r"C:\Program Files\nodejs\npx.cmd",
             r"C:\Program Files (x86)\nodejs\npx.cmd",
@@ -42,13 +34,14 @@ def get_npx_command():
         for path in possible_paths:
             if os.path.exists(path):
                 return path
-        return "npx"  # fallback
+        return "npx"
     else:
         return "npx"
 
 NPX_CMD = get_npx_command()
 print(f"[DEBUG] Using npx command: {NPX_CMD}")
 
+# MCP Server configurations
 MCP_SERVERS = {
     "calendar": {
         "command": NPX_CMD,
@@ -95,7 +88,7 @@ class MCPProcessManager:
     def start_server(self, server_name: str):
         """Start an MCP server process"""
         if server_name in self.processes:
-            return  # Already running
+            return
         
         if server_name not in MCP_SERVERS:
             raise ValueError(f"Unknown server: {server_name}")
@@ -105,7 +98,6 @@ class MCPProcessManager:
         
         print(f"[DEBUG] Starting {server_name} MCP server...")
         
-        # Start process with PIPE
         process = subprocess.Popen(
             [server_config["command"]] + server_config["args"],
             stdin=subprocess.PIPE,
@@ -119,7 +111,6 @@ class MCPProcessManager:
         self.processes[server_name] = process
         self.response_queues[server_name] = Queue()
         
-        # Start reader thread for stdout
         reader_thread = threading.Thread(
             target=self._read_output,
             args=(server_name, process),
@@ -127,16 +118,61 @@ class MCPProcessManager:
         )
         reader_thread.start()
         self.reader_threads[server_name] = reader_thread
+        stderr_thread = threading.Thread(
+        target=self._read_stderr,
+        args=(server_name, process),
+        daemon=True
+        )
+        stderr_thread.start()
         
         print(f"[DEBUG] {server_name} MCP server started (PID: {process.pid})")
-    
+        import time
+        time.sleep(0.5)  # Let server start
+        
+        init_request = {
+            "jsonrpc": "2.0",
+            "id": 0,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "mcp-client",
+                    "version": "1.0.0"
+                }
+            }
+        }
+        
+        print(f"[DEBUG] Sending initialize to {server_name}")
+        process.stdin.write(json.dumps(init_request) + "\n")
+        process.stdin.flush()
+        try:
+            init_response = self.response_queues[server_name].get(timeout=5)
+            print(f"[DEBUG] {server_name} initialized: {init_response}")
+            
+            # Send initialized notification (MCP protocol requirement)
+            initialized_notif = {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized"
+            }
+            process.stdin.write(json.dumps(initialized_notif) + "\n")
+            process.stdin.flush()
+            
+        except Empty:
+            print(f"[WARN] {server_name} initialize timeout")
+            # Wait for initialize response
+        # time.sleep(1)
     def _read_output(self, server_name: str, process: subprocess.Popen):
+        """Read JSON-RPC responses from stdout with proper HTTP-style framing"""
         try:
             while True:
                 # Read headers
                 headers = {}
                 while True:
-                    line = process.stdout.readline().strip()
+                    line = process.stdout.readline()
+                    if not line:
+                        return
+                    line = line.strip()
                     if not line:  # Empty line = end of headers
                         break
                     if ':' in line:
@@ -147,22 +183,33 @@ class MCPProcessManager:
                 if 'Content-Length' in headers:
                     length = int(headers['Content-Length'])
                     body = process.stdout.read(length)
-                    response = json.loads(body)
-                    self.response_queues[server_name].put(response)
+                    print(f"[DEBUG] {server_name} response: {body}")
+                    try:
+                        response = json.loads(body)
+                        self.response_queues[server_name].put(response)
+                    except json.JSONDecodeError as e:
+                        print(f"[ERROR] {server_name} JSON decode error: {e}")
+                        print(f"[ERROR] Body was: {body}")
         except Exception as e:
             print(f"[ERROR] Reader thread for {server_name} crashed: {e}")
+            traceback.print_exc()
+    
+    def _read_stderr(self, server_name: str, process: subprocess.Popen):
+        """Read stderr output for debugging"""
+        try:
+            for line in process.stderr:
+                print(f"[STDERR {server_name}] {line.strip()}")
+        except Exception as e:
+            print(f"[ERROR] stderr reader for {server_name}: {e}")
     
     def call_server(self, server_name: str, method: str, params: Dict[str, Any], timeout: int = 10):
-        """
-        Call an MCP server with JSON-RPC request
-        """
+        """Call an MCP server with JSON-RPC request"""
         if server_name not in self.processes:
             self.start_server(server_name)
         
         process = self.processes[server_name]
         queue = self.response_queues[server_name]
         
-        # Prepare JSON-RPC request
         request = {
             "jsonrpc": "2.0",
             "id": 1,
@@ -172,7 +219,6 @@ class MCPProcessManager:
         
         print(f"[DEBUG] Sending to {server_name}: {request}")
         
-        # Send request to stdin
         try:
             request_json = json.dumps(request) + "\n"
             process.stdin.write(request_json)
@@ -182,10 +228,8 @@ class MCPProcessManager:
             traceback.print_exc()
             raise
         
-        # Wait for response from queue
         try:
-            import queue
-            response = self.response_queues[server_name].get(timeout=timeout)
+            response = queue.get(timeout=timeout)
             print(f"[DEBUG] Response from {server_name}: {response}")
             
             if "error" in response:
@@ -207,33 +251,10 @@ class MCPProcessManager:
 mcp_manager = MCPProcessManager()
 
 
-async def search_calendar(query: str) -> List[Dict]:
-    """Search Google Calendar via MCP server"""
+def list_calendar_tool(start_date: str = None, end_date: str = None, query: str = None):
+    """Tool function for OpenAI to call - List/search calendar events"""
     try:
-        print(f"[DEBUG] Searching calendar with query: {query}")
-        result = mcp_manager.call_server(
-            "calendar",
-            "tools/call",
-            {
-                "name": "list-events",
-                "arguments": {"query": query}
-            }
-        )
-        print(f"[DEBUG] Calendar result: {result}")
-        return result if isinstance(result, list) else []
-    except Exception as e:
-        print(f"Calendar search error: {e}")
-        traceback.print_exc()
-        return []
-
-
-def search_calendar_tool(start_date: str = None, end_date: str = None, query: str = None):
-    """
-    Tool function for OpenAI to call
-    Search Google Calendar for events
-    """
-    try:
-        print(f"[TOOL CALL] search_calendar - start: {start_date}, end: {end_date}, query: {query}")
+        print(f"[TOOL CALL] list_calendar - start: {start_date}, end: {end_date}, query: {query}")
         
         params = {}
         if start_date:
@@ -247,10 +268,16 @@ def search_calendar_tool(start_date: str = None, end_date: str = None, query: st
             "calendar",
             "tools/call",
             {
-                "name": "search_events",
+                "name": "list-events",
                 "arguments": params
             }
         )
+        
+        # Handle error responses
+        if isinstance(result, dict) and result.get("isError"):
+            error_msg = result.get("content", [{}])[0].get("text", "Unknown error")
+            return json.dumps({"error": f"Calendar error: {error_msg}"})
+        
         print(f"[TOOL RESULT] Calendar: {result}")
         return json.dumps(result)
     except Exception as e:
@@ -259,31 +286,8 @@ def search_calendar_tool(start_date: str = None, end_date: str = None, query: st
         return json.dumps({"error": str(e)})
 
 
-async def search_notion(query: str) -> List[Dict]:
-    """Search Notion via MCP server"""
-    try:
-        print(f"[DEBUG] Searching Notion with query: {query}")
-        result = mcp_manager.call_server(
-            "notion",
-            "tools/call",
-            {
-                "name": "search",
-                "arguments": {"query": query}
-            }
-        )
-        print(f"[DEBUG] Notion result: {result}")
-        return result if isinstance(result, list) else []
-    except Exception as e:
-        print(f"Notion search error: {e}")
-        traceback.print_exc()
-        return []
-
-
 def search_notion_tool(query: str):
-    """
-    Tool function for OpenAI to call
-    Search Notion pages and databases
-    """
+    """Tool function for OpenAI to call - Search Notion pages"""
     try:
         print(f"[TOOL CALL] search_notion - query: {query}")
         
@@ -295,6 +299,12 @@ def search_notion_tool(query: str):
                 "arguments": {"query": query}
             }
         )
+        
+        # Handle error responses
+        if isinstance(result, dict) and result.get("isError"):
+            error_msg = result.get("content", [{}])[0].get("text", "Unknown error")
+            return json.dumps({"error": f"Notion error: {error_msg}"})
+        
         print(f"[TOOL RESULT] Notion: {result}")
         return json.dumps(result)
     except Exception as e:
@@ -303,28 +313,23 @@ def search_notion_tool(query: str):
         return json.dumps({"error": str(e)})
 
 
-async def search_drive(query: str) -> List[Dict]:
-    """Google Drive removed - not implemented"""
-    return []
-
-
 # OpenAI Tools Definition
 OPENAI_TOOLS = [
     {
         "type": "function",
         "function": {
             "name": "list_calendar",
-            "description": "Search Google Calendar for events. Use this to find meetings, appointments, and scheduled events.",
+            "description": "List or search Google Calendar events. Use this to find meetings, appointments, and scheduled events.",
             "parameters": {
                 "type": "object",
                 "properties": {
                     "start_date": {
                         "type": "string",
-                        "description": "Start date in YYYY-MM-DD format (e.g., 2024-12-07)"
+                        "description": "Start date in YYYY-MM-DD format (e.g., 2025-12-07)"
                     },
                     "end_date": {
                         "type": "string",
-                        "description": "End date in YYYY-MM-DD format (e.g., 2024-12-14)"
+                        "description": "End date in YYYY-MM-DD format (e.g., 2025-12-14)"
                     },
                     "query": {
                         "type": "string",
@@ -355,19 +360,18 @@ OPENAI_TOOLS = [
 
 # Map function names to actual functions
 TOOL_FUNCTIONS = {
-    "search_calendar": search_calendar_tool,
+    "list_calendar": list_calendar_tool,
     "search_notion": search_notion_tool
 }
 
 
 async def query_with_openai_tools(question: str):
-    """
-    Query OpenAI with function calling - it decides which tools to use
-    """
+    """Query OpenAI with function calling - it decides which tools to use"""
+    today = datetime.now().strftime('%Y-%m-%d')
     messages = [
         {
             "role": "system",
-            "content": f"You are a helpful assistant with access to the user's Notion and Google Calendar. Today's date is {datetime.now().strftime('%Y-%m-%d')}.  Use the available tools to search for information and answer questions accurately."
+            "content": f"You are a helpful assistant with access to the user's Notion and Google Calendar. Today's date is {today}. Use the available tools to search for information and answer questions accurately."
         },
         {
             "role": "user",
@@ -376,7 +380,6 @@ async def query_with_openai_tools(question: str):
     ]
     
     try:
-        # Initial call to OpenAI with tools
         print(f"[DEBUG] Calling OpenAI with question: {question}")
         response = client.chat.completions.create(
             model="gpt-4.1-nano",
@@ -388,7 +391,6 @@ async def query_with_openai_tools(question: str):
         response_message = response.choices[0].message
         tool_calls = response_message.tool_calls
         
-        # If no tool calls, return the response
         if not tool_calls:
             return {
                 "answer": response_message.content,
@@ -396,23 +398,27 @@ async def query_with_openai_tools(question: str):
                 "sources": []
             }
         
-        # Execute tool calls
+        # Add assistant message with tool calls
         messages.append(response_message)
         
         tool_results = []
         sources = []
         
-        for tool_call in tool_calls:  # This loops correctly
+        # Execute each tool call and add response immediately
+        for tool_call in tool_calls:
             function_name = tool_call.function.name
             function_args = json.loads(tool_call.function.arguments)
             
             print(f"[DEBUG] OpenAI wants to call: {function_name} with {function_args}")
             
-            # Execute the tool
             if function_name in TOOL_FUNCTIONS:
                 function_response = TOOL_FUNCTIONS[function_name](**function_args)
+                tool_results.append({
+                    "tool": function_name,
+                    "result": function_response
+                })
                 
-                # ADD THIS - append tool response for EACH tool_call
+                # Add tool response immediately (CRITICAL FIX)
                 messages.append({
                     "tool_call_id": tool_call.id,
                     "role": "tool",
@@ -433,14 +439,6 @@ async def query_with_openai_tools(question: str):
                                 })
                 except:
                     pass
-                
-                # Add tool result to messages
-                messages.append({
-                    "tool_call_id": tool_call.id,
-                    "role": "tool",
-                    "name": function_name,
-                    "content": function_response
-                })
         
         # Get final response from OpenAI with tool results
         print(f"[DEBUG] Getting final answer from OpenAI with tool results")
@@ -507,10 +505,8 @@ async def query_knowledge_base(request: QueryRequest):
     try:
         print(f"[DEBUG] Processing query: {request.question}")
         
-        # Let OpenAI decide which tools to call
         result = await query_with_openai_tools(request.question)
         
-        # Format response
         sources = []
         for source_data in result["sources"]:
             sources.append(Source(
