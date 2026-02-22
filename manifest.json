@@ -1,0 +1,22 @@
+{
+  "manifest_version": "0.2",
+  "name": "manufacturing-mcp",
+  "version": "1.0.0",
+  "description": "Manufacturing intelligence — query factories, machines, work orders, quality and maintenance data",
+  "author": {
+    "name": "Ali"
+  },
+  "server": {
+    "type": "python",
+    "entry_point": "server.py",
+    "mcp_config": {
+      "command": "D:\\my_projects\\sql_mcp\\env\\Scripts\\python.exe",
+      "args": [
+        "${__dirname}/server.py"
+      ],
+      "env": {}
+    }
+  },
+  "keywords": ["manufacturing", "mcp", "sqlite"],
+  "license": "MIT"
+}
