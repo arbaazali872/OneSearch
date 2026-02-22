@@ -1,30 +1,33 @@
 """
 Manufacturing Intelligence MCP Server
-Provides Claude with tools to query a manufacturing SQLite database.
+Supports SQLite, PostgreSQL, MySQL, and MSSQL via a connection string.
+Set DB_URL environment variable or defaults to local SQLite demo database.
 """
 
-import sqlite3
 import json
 import os
 from typing import Optional
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field, ConfigDict
+from sqlalchemy import create_engine, text
+from sqlalchemy.exc import SQLAlchemyError
 
-# ── Config ──────────────────────────────────────────────────────────────────
-DB_PATH = os.path.join(os.path.dirname(__file__), "manufacturing.db")
+# ── Config ───────────────────────────────────────────────────────────────────
+# Claude Desktop injects DB_URL from user_config in manifest.json
+# Falls back to local SQLite demo database if not set
+_default_db = f"sqlite:///{os.path.join(os.path.dirname(os.path.abspath(__file__)), 'manufacturing.db')}"
+DB_URL = os.environ.get("DB_URL", _default_db)
 
+engine = create_engine(DB_URL)
 mcp = FastMCP("manufacturing_mcp")
 
 
-# ── DB Helper ────────────────────────────────────────────────────────────────
-def query_db(sql: str, params: tuple = ()) -> list[dict]:
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    try:
-        rows = conn.execute(sql, params).fetchall()
-        return [dict(r) for r in rows]
-    finally:
-        conn.close()
+# ── DB Helper ─────────────────────────────────────────────────────────────────
+def query_db(sql: str, params: dict = {}) -> list[dict]:
+    with engine.connect() as conn:
+        result = conn.execute(text(sql), params)
+        keys = result.keys()
+        return [dict(zip(keys, row)) for row in result.fetchall()]
 
 
 def fmt(rows: list[dict]) -> str:
@@ -33,22 +36,19 @@ def fmt(rows: list[dict]) -> str:
     return json.dumps(rows, indent=2, default=str)
 
 
-# ── Input Models ─────────────────────────────────────────────────────────────
+# ── Input Models ──────────────────────────────────────────────────────────────
 class SqlInput(BaseModel):
     model_config = ConfigDict(str_strip_whitespace=True, extra="forbid")
     sql: str = Field(..., description="A read-only SQL SELECT statement", min_length=5)
-
 
 class FactoryFilter(BaseModel):
     model_config = ConfigDict(extra="forbid")
     factory_id: Optional[int] = Field(None, description="Filter by factory ID (1-5)")
 
-
 class MachineFilter(BaseModel):
     model_config = ConfigDict(extra="forbid")
     status: Optional[str] = Field(None, description="Filter by status: operational | maintenance | offline")
     factory_id: Optional[int] = Field(None, description="Filter by factory ID")
-
 
 class WorkOrderFilter(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -57,13 +57,11 @@ class WorkOrderFilter(BaseModel):
     factory_id: Optional[int] = Field(None, description="Filter by factory ID")
     limit: int = Field(20, description="Max rows to return", ge=1, le=100)
 
-
 class InspectionFilter(BaseModel):
     model_config = ConfigDict(extra="forbid")
     result: Optional[str] = Field(None, description="pass | fail | conditional_pass")
     factory_id: Optional[int] = Field(None, description="Filter by factory ID")
     limit: int = Field(20, ge=1, le=100)
-
 
 class MaintenanceFilter(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -72,12 +70,9 @@ class MaintenanceFilter(BaseModel):
     limit: int = Field(20, ge=1, le=100)
 
 
-# ── Tools ────────────────────────────────────────────────────────────────────
+# ── Tools ─────────────────────────────────────────────────────────────────────
 
-@mcp.tool(
-    name="manufacturing_run_query",
-    annotations={"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True}
-)
+@mcp.tool(name="manufacturing_run_query", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def run_query(params: SqlInput) -> str:
     """
     Execute any read-only SQL SELECT query against the manufacturing database.
@@ -91,49 +86,38 @@ async def run_query(params: SqlInput) -> str:
     if not sql.lower().startswith("select"):
         return "Error: Only SELECT statements are allowed."
     try:
-        rows = query_db(sql)
-        return fmt(rows)
-    except Exception as e:
+        return fmt(query_db(sql))
+    except SQLAlchemyError as e:
         return f"Query error: {e}"
 
 
-@mcp.tool(
-    name="manufacturing_get_schema",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
-)
+@mcp.tool(name="manufacturing_get_schema", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def get_schema() -> str:
     """
-    Return the full schema of the manufacturing database:
-    all tables, columns, types, and foreign key relationships.
+    Return the full schema of the manufacturing database.
     Always call this first to understand the data model before writing queries.
     """
-    conn = sqlite3.connect(DB_PATH)
     try:
-        tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name").fetchall()
+        from sqlalchemy import inspect as sa_inspect
+        inspector = sa_inspect(engine)
         result = {}
-        for (tname,) in tables:
-            cols = conn.execute(f"PRAGMA table_info({tname})").fetchall()
-            fks  = conn.execute(f"PRAGMA foreign_key_list({tname})").fetchall()
+        for tname in inspector.get_table_names():
+            cols = inspector.get_columns(tname)
+            fks  = inspector.get_foreign_keys(tname)
             result[tname] = {
-                "columns": [{"name": c[1], "type": c[2], "not_null": bool(c[3]), "pk": bool(c[5])} for c in cols],
-                "foreign_keys": [{"from": f[3], "to_table": f[2], "to_col": f[4]} for f in fks],
+                "columns": [{"name": c["name"], "type": str(c["type"]), "nullable": c["nullable"]} for c in cols],
+                "foreign_keys": [{"from": fk["constrained_columns"], "to_table": fk["referred_table"]} for fk in fks],
             }
         return json.dumps(result, indent=2)
-    finally:
-        conn.close()
+    except SQLAlchemyError as e:
+        return f"Schema error: {e}"
 
 
-@mcp.tool(
-    name="manufacturing_list_factories",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
-)
+@mcp.tool(name="manufacturing_list_factories", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def list_factories(params: FactoryFilter) -> str:
-    """
-    List all factories with their production lines and machine counts.
-    Optionally filter by factory_id.
-    """
+    """List all factories with their production lines and machine counts."""
     sql = """
-        SELECT f.id, f.name, f.location, f.country, f.established_year, f.total_area_sqm,
+        SELECT f.id, f.name, f.location, f.country, f.established_year,
                COUNT(DISTINCT pl.id) AS production_lines,
                COUNT(DISTINCT m.id)  AS machines
         FROM factories f
@@ -141,53 +125,40 @@ async def list_factories(params: FactoryFilter) -> str:
         LEFT JOIN machines m ON m.production_line_id = pl.id
         WHERE f.active = 1
     """
-    args = []
+    args = {}
     if params.factory_id:
-        sql += " AND f.id = ?"
-        args.append(params.factory_id)
+        sql += " AND f.id = :fid"
+        args["fid"] = params.factory_id
     sql += " GROUP BY f.id ORDER BY f.name"
-    return fmt(query_db(sql, tuple(args)))
+    return fmt(query_db(sql, args))
 
 
-@mcp.tool(
-    name="manufacturing_get_machines",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
-)
+@mcp.tool(name="manufacturing_get_machines", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def get_machines(params: MachineFilter) -> str:
-    """
-    List machines with their production line, factory, current status,
-    cumulative downtime hours, and age. Filter by status or factory.
-    """
+    """List machines with status, downtime hours, and age. Filter by status or factory."""
     sql = """
         SELECT m.id, m.name, m.model, m.manufacturer, m.status,
-               m.age_years, m.cumulative_downtime_hours,
-               m.last_maintenance_date,
+               m.age_years, m.cumulative_downtime_hours, m.last_maintenance_date,
                pl.name AS production_line, f.name AS factory
         FROM machines m
         JOIN production_lines pl ON pl.id = m.production_line_id
         JOIN factories f ON f.id = pl.factory_id
         WHERE 1=1
     """
-    args = []
+    args = {}
     if params.status:
-        sql += " AND m.status = ?"
-        args.append(params.status)
+        sql += " AND m.status = :status"
+        args["status"] = params.status
     if params.factory_id:
-        sql += " AND f.id = ?"
-        args.append(params.factory_id)
+        sql += " AND f.id = :fid"
+        args["fid"] = params.factory_id
     sql += " ORDER BY m.cumulative_downtime_hours DESC"
-    return fmt(query_db(sql, tuple(args)))
+    return fmt(query_db(sql, args))
 
 
-@mcp.tool(
-    name="manufacturing_get_work_orders",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
-)
+@mcp.tool(name="manufacturing_get_work_orders", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def get_work_orders(params: WorkOrderFilter) -> str:
-    """
-    List work orders with operator name, production line, factory,
-    completion rate, and priority. Filter by status, priority, or factory.
-    """
+    """List work orders with operator, completion rate, and priority."""
     sql = """
         SELECT wo.id, wo.product_name, wo.status, wo.priority,
                wo.quantity_target, wo.quantity_produced,
@@ -200,31 +171,24 @@ async def get_work_orders(params: WorkOrderFilter) -> str:
         JOIN factories f ON f.id = pl.factory_id
         WHERE 1=1
     """
-    args = []
+    args = {}
     if params.status:
-        sql += " AND wo.status = ?"
-        args.append(params.status)
+        sql += " AND wo.status = :status"
+        args["status"] = params.status
     if params.priority:
-        sql += " AND wo.priority = ?"
-        args.append(params.priority)
+        sql += " AND wo.priority = :priority"
+        args["priority"] = params.priority
     if params.factory_id:
-        sql += " AND f.id = ?"
-        args.append(params.factory_id)
-    sql += f" ORDER BY wo.start_date DESC LIMIT ?"
-    args.append(params.limit)
-    return fmt(query_db(sql, tuple(args)))
+        sql += " AND f.id = :fid"
+        args["fid"] = params.factory_id
+    sql += " ORDER BY wo.start_date DESC LIMIT :lim"
+    args["lim"] = params.limit
+    return fmt(query_db(sql, args))
 
 
-@mcp.tool(
-    name="manufacturing_quality_summary",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
-)
+@mcp.tool(name="manufacturing_quality_summary", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def quality_summary(params: InspectionFilter) -> str:
-    """
-    Show quality inspection results: pass/fail rates, top defect types,
-    and defect counts. Filter by result type or factory.
-    """
-    # Overall stats per factory
+    """Show quality inspection results, pass/fail rates and top defect types."""
     sql = """
         SELECT f.name AS factory, qi.result,
                COUNT(*) AS count,
@@ -236,27 +200,21 @@ async def quality_summary(params: InspectionFilter) -> str:
         JOIN factories f ON f.id = pl.factory_id
         WHERE 1=1
     """
-    args = []
+    args = {}
     if params.result:
-        sql += " AND qi.result = ?"
-        args.append(params.result)
+        sql += " AND qi.result = :result"
+        args["result"] = params.result
     if params.factory_id:
-        sql += " AND f.id = ?"
-        args.append(params.factory_id)
-    sql += f" GROUP BY f.name, qi.result, qi.defect_type ORDER BY total_defects DESC LIMIT ?"
-    args.append(params.limit)
-    return fmt(query_db(sql, tuple(args)))
+        sql += " AND f.id = :fid"
+        args["fid"] = params.factory_id
+    sql += " GROUP BY f.name, qi.result, qi.defect_type ORDER BY total_defects DESC LIMIT :lim"
+    args["lim"] = params.limit
+    return fmt(query_db(sql, args))
 
 
-@mcp.tool(
-    name="manufacturing_maintenance_report",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
-)
+@mcp.tool(name="manufacturing_maintenance_report", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def maintenance_report(params: MaintenanceFilter) -> str:
-    """
-    Show maintenance logs with machine name, factory, downtime hours, cost,
-    and type. Filter by machine or maintenance type.
-    """
+    """Show maintenance logs with downtime hours and cost. Filter by machine or type."""
     sql = """
         SELECT ml.id, ml.maintenance_date, ml.maintenance_type,
                ml.downtime_hours, ml.cost, ml.description, ml.resolved,
@@ -269,34 +227,25 @@ async def maintenance_report(params: MaintenanceFilter) -> str:
         JOIN employees e ON e.id = ml.technician_id
         WHERE 1=1
     """
-    args = []
+    args = {}
     if params.machine_id:
-        sql += " AND ml.machine_id = ?"
-        args.append(params.machine_id)
+        sql += " AND ml.machine_id = :mid"
+        args["mid"] = params.machine_id
     if params.maintenance_type:
-        sql += " AND ml.maintenance_type = ?"
-        args.append(params.maintenance_type)
-    sql += f" ORDER BY ml.maintenance_date DESC LIMIT ?"
-    args.append(params.limit)
-    return fmt(query_db(sql, tuple(args)))
+        sql += " AND ml.maintenance_type = :mtype"
+        args["mtype"] = params.maintenance_type
+    sql += " ORDER BY ml.maintenance_date DESC LIMIT :lim"
+    args["lim"] = params.limit
+    return fmt(query_db(sql, args))
 
 
-@mcp.tool(
-    name="manufacturing_inventory_status",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
-)
+@mcp.tool(name="manufacturing_inventory_status", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def inventory_status() -> str:
-    """
-    Show current parts inventory with stock levels, reorder thresholds,
-    supplier info, and flags for items below reorder threshold.
-    Also shows any pending or shipped purchase orders per part.
-    """
+    """Show parts inventory with stock levels, reorder flags, and open purchase orders."""
     sql = """
-        SELECT p.id, p.name, p.sku, p.category, p.stock_quantity,
-               p.reorder_threshold,
+        SELECT p.id, p.name, p.sku, p.category, p.stock_quantity, p.reorder_threshold,
                CASE WHEN p.stock_quantity < p.reorder_threshold THEN 'LOW STOCK' ELSE 'OK' END AS stock_status,
-               p.unit_cost,
-               s.name AS supplier, s.lead_time_days, s.reliability_score,
+               p.unit_cost, s.name AS supplier, s.lead_time_days, s.reliability_score,
                COUNT(po.id) AS open_purchase_orders
         FROM parts p
         JOIN suppliers s ON s.id = p.supplier_id
@@ -307,15 +256,9 @@ async def inventory_status() -> str:
     return fmt(query_db(sql))
 
 
-@mcp.tool(
-    name="manufacturing_supplier_performance",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
-)
+@mcp.tool(name="manufacturing_supplier_performance", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def supplier_performance() -> str:
-    """
-    Analyze supplier performance: on-time delivery rate, average delay days,
-    order counts by status, and reliability scores.
-    """
+    """Analyze supplier performance: on-time delivery rate, average delay, reliability scores."""
     sql = """
         SELECT s.name AS supplier, s.country, s.reliability_score, s.lead_time_days,
                COUNT(po.id) AS total_orders,
@@ -335,15 +278,9 @@ async def supplier_performance() -> str:
     return fmt(query_db(sql))
 
 
-@mcp.tool(
-    name="manufacturing_operator_performance",
-    annotations={"readOnlyHint": True, "destructiveHint": False}
-)
+@mcp.tool(name="manufacturing_operator_performance", annotations={"readOnlyHint": True, "destructiveHint": False})
 async def operator_performance() -> str:
-    """
-    Rank operators by work order completion rate and quality defect rate.
-    Shows total work orders, completion %, and associated defect counts.
-    """
+    """Rank operators by work order completion rate and associated defect counts."""
     sql = """
         SELECT e.name AS operator, e.shift, f.name AS factory,
                COUNT(DISTINCT wo.id) AS total_work_orders,
@@ -363,6 +300,6 @@ async def operator_performance() -> str:
     return fmt(query_db(sql))
 
 
-# ── Entry point ──────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     mcp.run(transport="stdio")
