@@ -1,8 +1,8 @@
 {
   "manifest_version": "0.2",
-  "name": "manufacturing-mcp",
-  "version": "1.1.0",
-  "description": "Natural language interface to your manufacturing database. Supports SQLite, PostgreSQL, MySQL, and MSSQL.",
+  "name": "telco-intelligence-mcp",
+  "version": "2.0.0",
+  "description": "Natural language interface to telco customer churn data. Query customer segments, analyse churn patterns, and predict churn risk using an ML model.",
   "author": {
     "name": "Ali"
   },
@@ -13,7 +13,8 @@
       "command": "python",
       "args": ["${__dirname}/server.py"],
       "env": {
-        "DB_URL": "${user_config.db_url}"
+        "DB_URL": "${user_config.db_url}",
+        "CHURN_API_URL": "http://localhost:8000"
       }
     }
   },
@@ -21,11 +22,11 @@
     "db_url": {
       "type": "string",
       "title": "Database URL",
-      "description": "Connection string for your database. Leave empty to use the built-in demo database. Examples: postgresql://user:pass@host:5432/mydb | mysql://user:pass@host:3306/mydb | sqlite:///C:/path/to/your.db",
+      "description": "Leave empty to use the default telco_churn.db. Custom example: sqlite:///C:/path/to/your.db",
       "required": false,
-      "sensitive": true
+      "sensitive": false
     }
   },
-  "keywords": ["manufacturing", "mcp", "sqlite", "postgresql", "mysql", "analytics"],
+  "keywords": ["telco", "churn", "mcp", "ml", "xgboost", "sqlite", "analytics"],
   "license": "MIT"
 }

@@ -1,59 +1,57 @@
-# Manufacturing Intelligence MCP
+# Telco Customer Intelligence MCP
 
-A Model Context Protocol (MCP) server that gives Claude natural language access to your manufacturing database. Ask questions in plain English — Claude figures out the schema, writes the SQL, and returns the answer.
+A Model Context Protocol (MCP) server that gives Claude natural language access to telco customer churn data — combining database analytics with an ML-powered churn prediction model.
 
-![Demo](https://img.shields.io/badge/MCP-Compatible-blue) ![Python](https://img.shields.io/badge/Python-3.10+-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
+![MCP](https://img.shields.io/badge/MCP-Compatible-blue) ![Python](https://img.shields.io/badge/Python-3.10+-green) ![License](https://img.shields.io/badge/License-MIT-yellow)
 
 ---
 
 ## What it does
 
-Instead of writing SQL queries, you just ask:
+Instead of writing SQL queries or calling APIs manually, you just ask:
 
-> *"Which factory has the most emergency maintenance events and what's the total downtime cost?"*
+> *"Which customer segments have the highest churn rate?"*
 
-> *"Which operators have the highest defect rates?"*
+> *"Show me high-risk customers on month-to-month contracts with fiber optic internet"*
 
-> *"What parts are below reorder threshold and do we have pending purchase orders for them?"*
+> *"Predict churn for a new customer: female, 1 month tenure, fiber optic, electronic check, month-to-month"*
 
-> *"Show me all work orders that are critical priority and still in progress"*
+> *"Give me a full churn report across all segments"*
 
-Claude reads your database schema, writes the appropriate SQL, executes it, and gives you a structured answer — all in one conversational turn.
-
----
-
-## How it works
-
-The server exposes two types of tools to Claude:
-
-**Schema discovery**
-- `manufacturing_get_schema` — introspects your connected database and returns all tables, columns, and relationships. Claude calls this automatically before writing any query.
-
-**Free-form queries**
-- `manufacturing_run_query` — executes any SELECT query Claude generates. This is the core tool — it works against any database schema, not just the demo one.
-
-**Pre-built tools** (convenience shortcuts for common questions)
-- `manufacturing_list_factories`
-- `manufacturing_get_machines`
-- `manufacturing_get_work_orders`
-- `manufacturing_quality_summary`
-- `manufacturing_maintenance_report`
-- `manufacturing_inventory_status`
-- `manufacturing_supplier_performance`
-- `manufacturing_operator_performance`
+Claude queries the database, calls the ML model, and returns structured answers — all in one conversational turn.
 
 ---
 
-## Supported databases
+## Architecture
 
-| Database   | Connection string format                              | Driver to install  |
-|------------|-------------------------------------------------------|--------------------|
-| SQLite     | `sqlite:///C:/path/to/your.db`                        | built-in           |
-| PostgreSQL | `postgresql://user:pass@host:5432/dbname`             | `psycopg2-binary`  |
-| MySQL      | `mysql+pymysql://user:pass@host:3306/dbname`          | `pymysql`          |
-| MSSQL      | `mssql+pyodbc://user:pass@host/dbname?driver=...`     | `pyodbc`           |
+```
+Claude Desktop
+      ↓
+MCP Server (server.py)
+      ├── DB tools  ──────────→ telco_churn.db (SQLite)
+      └── ML tools  ──────────→ FastAPI /predict (XGBoost model)
+```
 
-No connection string? No problem — it defaults to the included SQLite demo database.
+The ML prediction API lives in a separate repo (`churn_ml_project`) and must be running locally before using the prediction tools.
+
+---
+
+## Tools
+
+**Analytics tools** (query the database)
+- `telco_churn_summary` — overall churn rate, average tenure, average charges
+- `telco_churn_by_segment` — churn breakdown by contract, internet service, payment method
+- `telco_get_customers` — filtered customer list with optional contract/internet/churn filters
+- `telco_high_risk_customers` — customers scored by known churn risk factors
+- `telco_run_query` — run any custom SELECT query against the database
+
+**ML tools** (call the prediction API)
+- `churn_api_health` — verify the prediction service is running
+- `predict_customer_churn` — predict churn for a customer profile using XGBoost
+
+**Prompts**
+- `daily_churn_report` — full executive report across all segments
+- `retention_analysis` — deep dive on a single customer with retention recommendations
 
 ---
 
@@ -63,108 +61,64 @@ No connection string? No problem — it defaults to the included SQLite demo dat
 - Python 3.10+
 - Claude Desktop (latest version)
 - Node.js (for the `mcpb` CLI)
+- The churn prediction FastAPI running locally ([churn_ml_project](https://github.com/arbaazali872/churn_ml_project))
 
-### 1. Clone the repo
-
-```bash
-git clone https://github.com/yourusername/manufacturing-mcp
-cd manufacturing-mcp
-```
-
-### 2. Create a virtual environment and install dependencies
+### 1. Clone and install
 
 ```bash
+git clone https://github.com/arbaazali872/OneSearch
+cd OneSearch
+
 python -m venv env
-
-# Windows
-env\Scripts\pip install -r requirements.txt
-
-# macOS / Linux
-env/bin/pip install -r requirements.txt
+env\Scripts\pip install -r requirements.txt  # Windows
+env/bin/pip install -r requirements.txt      # macOS / Linux
 ```
 
-If you're connecting to PostgreSQL or MySQL, also install the relevant driver:
+### 2. Download the dataset
 
-```bash
-pip install psycopg2-binary   # PostgreSQL
-pip install pymysql            # MySQL
+Download `WA_Fn-UseC_-Telco-Customer-Churn.csv` from [Kaggle](https://www.kaggle.com/datasets/blastchar/telco-customer-churn) and place it in `data/`:
+
+```
+OneSearch/
+└── data/
+    └── WA_Fn-UseC_-Telco-Customer-Churn.csv
 ```
 
-### 3. Seed the demo database (optional)
-
-If you want to try it with the included fake manufacturing data:
+### 3. Seed the database
 
 ```bash
-# Windows
-env\Scripts\python seed_db.py
-
-# macOS / Linux
-env/bin/python seed_db.py
+python seed_db.py --input data/WA_Fn-UseC_-Telco-Customer-Churn.csv
 ```
 
-This creates `manufacturing.db` with 5 factories, 16 machines, 200 work orders, 500 quality inspections, and more.
+This creates `telco_churn.db` with 7,043 real customer records (26.5% churn rate).
 
-### 4. Pack the extension
+### 4. Start the prediction API
 
 ```bash
-npm install -g @anthropic-ai/mcpb
+cd ../churn_ml_project
+python -m uvicorn src.app.app_api_only:app --host 0.0.0.0 --port 8000
+```
+
+### 5. Pack and install the extension
+
+```bash
+cd ../OneSearch
 mcpb pack
 ```
 
-This produces a `manufacturing-mcp.mcpb` file in the current directory.
-
-### 5. Install in Claude Desktop
-
-1. Open Claude Desktop → **Settings → Extensions**
-2. Click **Install Extension…**
-3. Select the `manufacturing-mcp.mcpb` file
-4. (Optional) Enter your database connection string in the settings field — leave blank to use the demo database
-5. Restart Claude Desktop
-
-You should now see the manufacturing tools available in Claude.
+Then in Claude Desktop → **Settings → Extensions → Install Extension** → select `telco-intelligence-mcp.mcpb` → Restart.
 
 ---
 
-## Connecting your own database
-
-When you install the extension, Claude Desktop shows a **Database URL** field in the extension settings. Paste your connection string there — it's stored encrypted in your OS keychain (Windows Credential Manager / macOS Keychain), never in plaintext.
-
-The server will introspect your schema automatically. Your tables don't need to match the demo schema — Claude will discover whatever structure you have and write queries accordingly.
-
-> **Note:** The pre-built convenience tools (e.g. `manufacturing_get_machines`) are designed around the demo schema. For your own database, Claude will primarily use `get_schema` + `run_query` to answer questions.
-
----
-
-## Demo database schema
-
-The included demo database models a multi-factory manufacturing operation:
+## Sample questions to try
 
 ```
-factories
-└── production_lines
-        └── machines
-                └── maintenance_logs
-
-        └── work_orders
-                └── work_order_parts
-                └── quality_inspections
-
-employees (operators, inspectors, technicians)
-suppliers
-└── parts
-        └── purchase_orders
-```
-
-**Sample questions to try:**
-
-```
-Which machines have had the most downtime this year?
-Which supplier has the worst on-time delivery rate?
-Show me all failed quality inspections from the last month
-Which production line has the highest defect rate?
-What's the total maintenance cost per factory?
-Are there any critical work orders where required parts are low in stock?
-Which operator has completed the most work orders with zero defects?
+What is the overall churn rate and which segment churns the most?
+Show me the top 10 highest-risk customers on month-to-month contracts
+Which payment method has the highest churn rate?
+Predict churn for a female customer, 2 months tenure, fiber optic, electronic check, month-to-month contract, $85/month
+Run a full daily churn report
+How many customers with two-year contracts have churned?
 ```
 
 ---
@@ -172,21 +126,22 @@ Which operator has completed the most work orders with zero defects?
 ## Project structure
 
 ```
-manufacturing-mcp/
-├── server.py           # MCP server — tools and DB logic
-├── seed_db.py          # Demo database generator
-├── manifest.json       # Extension metadata for Claude Desktop
+OneSearch/
+├── server.py           # Unified MCP server — DB tools + ML tools
+├── seed_db.py          # Loads CSV into SQLite
+├── manifest.json       # Claude Desktop extension config
 ├── requirements.txt    # Python dependencies
-└── manufacturing.db    # Demo database (generated by seed_db.py, not in repo)
+├── data/               # Put the Kaggle CSV here
+└── telco_churn.db      # Generated by seed_db.py (not in repo)
 ```
 
 ---
 
 ## Privacy note
 
-Query results are sent to the Anthropic API as part of the Claude conversation. The database itself stays on your machine — only the results of executed queries leave your system. Review [Anthropic's privacy policy](https://www.anthropic.com/privacy) if you're handling sensitive data.
+Query results and customer profiles are sent to the Anthropic API as part of the Claude conversation. The database stays on your machine — only query results leave your system. Do not use real customer PII with this setup without reviewing [Anthropic's privacy policy](https://www.anthropic.com/privacy).
 
-For air-gapped / fully local usage, this MCP server is compatible with any MCP client that supports local stdio servers — including those running local LLMs.
+For fully local usage, this MCP server works with any MCP client that supports local stdio servers, including those running local LLMs.
 
 ---
 
