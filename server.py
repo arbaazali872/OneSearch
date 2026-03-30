@@ -299,6 +299,28 @@ async def operator_performance() -> str:
     """
     return fmt(query_db(sql))
 
+# ── Prompts ───────────────────────────────────────────────────────────────────
+
+@mcp.prompt(name="daily_report")
+def daily_report_prompt() -> str:
+    """Generate a daily manufacturing intelligence report across all factories."""
+    return """Generate a daily manufacturing intelligence report by doing the following in order:
+
+1. Call manufacturing_list_factories to get an overview of all active factories
+2. Call manufacturing_get_machines with status="offline" to find critical machine issues
+3. Call manufacturing_get_machines with status="maintenance" to find machines under maintenance
+4. Call manufacturing_inventory_status to flag any LOW STOCK parts
+5. Call manufacturing_quality_summary with result="fail" to surface top defect trends
+6. Call manufacturing_get_work_orders with status="in_progress" and priority="critical"
+7. Call manufacturing_supplier_performance to flag any unreliable suppliers
+
+Then summarize all findings as a concise executive report with:
+- 🔴 Critical issues requiring immediate action (offline machines, critical work orders, very low stock)
+- 🟡 Warnings to monitor (maintenance, conditional passes, delayed suppliers)
+- 🟢 Things running smoothly
+Keep it brief and business-focused — avoid raw database values, translate into actionable insights.
+"""
+
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
