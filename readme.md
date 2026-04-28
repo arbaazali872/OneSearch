@@ -24,7 +24,7 @@ Claude queries the database, calls the ML model, and returns structured answers 
 
 ## Demo
 
-<video src="demo/demo.mp4" controls width="100%"></video>
+<video src="demo/demo.webm" controls width="100%"></video>
 
 *Full walkthrough: natural language churn queries, segment analysis, and live ML predictions — all inside Claude Desktop.*
 
